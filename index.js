@@ -46,6 +46,15 @@ const authenticateApiKey = async (req, res, next) => {
   }
 };
 
+// --- ADMIN-ONLY AUTHENTICATION MIDDLEWARE ---
+const authenticateAdmin = (req, res, next) => {
+    if (!req.user || req.user.role !== 'admin') {
+        return res.status(403).send({ error: 'Forbidden: Admin access required.' });
+    }
+    next();
+};
+
+
 // --- API ENDPOINTS ---
 
 // Health check route
@@ -98,27 +107,32 @@ app.post('/api/sender-ids/request', authenticateApiKey, async (req, res) => {
 
 /**
  * POST /api/send-sms
- * Sends a single or bulk SMS.
+ * Sends a single or bulk SMS with detailed logging.
  */
 app.post('/api/send-sms', authenticateApiKey, async (req, res) => {
-    const { to, from, message } = req.body; // `to` can be a string or an array of strings
+    const { to, from, message } = req.body;
     const uid = req.user.uid;
-    
+    console.log(`[${new Date().toISOString()}] Received SMS request from user ${uid}.`);
+    console.log(` > To: ${JSON.stringify(to)}, From: ${from}`);
+
     if (!to || !from || !message) {
+        console.log(" > Validation failed: Missing required fields.");
         return res.status(400).send({ error: 'Missing required fields: to, from, message.' });
     }
-    
-    // Check if user is allowed to use this senderId
+
+    console.log(` > Verifying sender ID '${from}' for user ${uid}...`);
     const senderIdRef = db.collection('senderIds');
     const senderIdSnapshot = await senderIdRef.where('userId', '==', uid).where('senderId', '==', from).where('status', '==', 'Approved').get();
     if (senderIdSnapshot.empty) {
+        console.log(` > Verification failed: Sender ID '${from}' is not approved.`);
         return res.status(403).send({ error: `Forbidden: Sender ID '${from}' is not approved for your account.` });
     }
+    console.log(` > Sender ID '${from}' is approved.`);
 
-    // Determine message parts (simplified logic)
     const parts = message.length > 160 ? Math.ceil(message.length / 153) : 1;
     const recipients = Array.isArray(to) ? to : [to];
     const cost = recipients.length * parts * 1.5;
+    console.log(` > Calculated cost: ${cost} coins for ${recipients.length} recipients and ${parts} parts.`);
 
     const userRef = db.collection('users').doc(uid);
 
@@ -126,34 +140,63 @@ app.post('/api/send-sms', authenticateApiKey, async (req, res) => {
         await db.runTransaction(async (transaction) => {
             const userDoc = await transaction.get(userRef);
             if (!userDoc.exists) {
+                console.log(` > Transaction error: User document for ${uid} not found.`);
                 throw new Error('User not found');
             }
 
-            const currentBalance = userDoc.data().balance;
+            const userData = userDoc.data();
+            const currentBalance = userData.balance;
+            console.log(` > Current user balance: ${currentBalance} coins.`);
             if (currentBalance < cost) {
+                console.log(` > Transaction error: Insufficient funds. Balance: ${currentBalance}, Cost: ${cost}.`);
                 throw new Error('INSUFFICIENT_FUNDS');
             }
 
-            // --- SMS Gateway API Call ---
-            // This is where you call the actual SMS gateway from your server
+            console.log(" > Preparing to call SMS gateway...");
             const apiKey = process.env.BULKSMSGH_API_KEY;
             const encodedMessage = encodeURIComponent(message);
             const smsApiUrl = `https://clientlogin.bulksmsgh.com/smsapi?key=${apiKey}&to=${recipients.join(',')}&msg=${encodedMessage}&sender_id=${from}`;
             
-            // Using fetch requires Node.js v18+. For older versions, use a library like 'axios' or 'node-fetch'.
+            console.log(` > Fetching URL (key redacted): https://clientlogin.bulksmsgh.com/smsapi?key=...&to=${recipients.join(',')}&msg=...&sender_id=${from}`);
+            
+            console.log(" > Calling SMS provider...");
             const smsResponse = await fetch(smsApiUrl);
             const responseText = await smsResponse.text();
+            console.log(` > SMS provider response status: ${smsResponse.status}`);
+            console.log(` > SMS provider response text: ${responseText}`);
 
-            if (!smsResponse.ok || !responseText.includes('OK')) {
-                console.error("SMS Provider Error:", responseText);
+            if (!smsResponse.ok || !responseText.trim().startsWith('OK')) {
+                console.error(" > SMS Provider Error:", responseText.trim());
                 throw new Error('PROVIDER_ERROR');
             }
-            // --- End of SMS Gateway Call ---
+            console.log(" > SMS provider call successful.");
 
-            // Update user's balance and log SMS history
-            transaction.update(userRef, { balance: admin.firestore.FieldValue.increment(-cost) });
+            const updates = { 
+                balance: admin.firestore.FieldValue.increment(-cost),
+                firstMessageSent: true // Mark first message as sent
+            };
+            console.log(` > Updating user balance. New balance will be ${currentBalance - cost}.`);
+            transaction.update(userRef, updates);
             
+            // Handle referral commission for the first message sent
+            if (userData.referredBy && !userData.firstMessageSent) {
+                console.log(` > First message sent by referred user. Checking for commission for referrer ${userData.referredBy}.`);
+                const referrerRef = db.collection('users').doc(userData.referredBy);
+                // We need to get the referrer outside the transaction for the update
+                // This is a simplified approach. A more robust solution might use a Cloud Function.
+                const referrerDoc = await referrerRef.get();
+                if (referrerDoc.exists()) {
+                    const commission = 1.00; // e.g., GH¢1.00 bonus
+                    console.log(` > Awarding GH¢${commission} commission to referrer ${userData.referredBy}.`);
+                    await referrerRef.update({
+                        referralBalance: admin.firestore.FieldValue.increment(commission),
+                        referralEarnings: admin.firestore.FieldValue.increment(commission)
+                    });
+                }
+            }
+
             const batchId = `api_batch_${Date.now()}`;
+            console.log(` > Logging ${recipients.length} SMS records to history with batchId ${batchId}.`);
             recipients.forEach(recipient => {
                 const historyRef = db.collection('smsHistory').doc();
                 transaction.set(historyRef, {
@@ -163,11 +206,12 @@ app.post('/api/send-sms', authenticateApiKey, async (req, res) => {
                     senderId: from,
                     parts,
                     date: new Date().toISOString(),
-                    status: 'Sent', // You might get this from the provider's response
+                    status: 'Sent',
                     type: recipients.length > 1 ? 'bulk' : 'single',
                     batchId,
                 });
             });
+            console.log(" > Transaction successful.");
         });
 
         res.status(200).send({ success: true, message: 'Messages queued for sending.' });
@@ -181,6 +225,52 @@ app.post('/api/send-sms', authenticateApiKey, async (req, res) => {
              return res.status(502).send({ success: false, code: 'PROVIDER_ERROR', message: 'There was an error with the SMS provider.' });
         }
         res.status(500).send({ success: false, message: 'An internal server error occurred.' });
+    }
+});
+
+
+/**
+ * POST /api/admin/send-system-sms
+ * Sends an SMS from the system using the default sender ID. Admin only.
+ */
+app.post('/api/admin/send-system-sms', authenticateApiKey, authenticateAdmin, async (req, res) => {
+    const { to, message } = req.body;
+
+    if (!to || !message) {
+        return res.status(400).send({ error: 'Missing required fields: to, message.' });
+    }
+    
+    const apiKey = process.env.BULKSMSGH_API_KEY;
+
+    try {
+        // Fetch system settings from Firestore
+        const settingsDoc = await db.collection('system').doc('settings').get();
+        if (!settingsDoc.exists) {
+            return res.status(500).send({ error: 'System settings not found in Firestore.' });
+        }
+        const settings = settingsDoc.data();
+        const senderId = settings.bulksmsghSenderId;
+
+        if (!senderId) {
+            return res.status(500).send({ error: 'System Sender ID is not configured in admin settings.' });
+        }
+
+        const encodedMessage = encodeURIComponent(message);
+        const smsApiUrl = `https://clientlogin.bulksmsgh.com/smsapi?key=${apiKey}&to=${to}&msg=${encodedMessage}&sender_id=${senderId}`;
+
+        const smsResponse = await fetch(smsApiUrl);
+        const responseText = await smsResponse.text();
+
+        if (!smsResponse.ok || !responseText.includes('OK')) {
+            console.error("System SMS Provider Error:", responseText);
+            throw new Error('PROVIDER_ERROR');
+        }
+
+        res.status(200).send({ success: true, message: 'System message sent successfully.' });
+
+    } catch (error) {
+        console.error('Error sending system SMS:', error.message);
+        res.status(500).send({ success: false, message: 'An internal server error occurred while sending the system SMS.' });
     }
 });
 
